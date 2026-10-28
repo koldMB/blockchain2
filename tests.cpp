@@ -160,8 +160,9 @@ static void test_tampering() {
     CHECK(!validate_chain(bad, r.initial, c.difficulty, err));
 }
 
+// runs a full simulation with many users and transactions and checks balances transaction counts rejected transactions and block validity
 static void test_full_run_invariants() {
-    std::cout << "[invariantai pilname begime]\n";
+    std::cout << "[invariantai paleidime]\n"; // https://www.cyfrin.io/glossary/invariant
     Config c = small_cfg();
     c.seed = 99;
     auto us = generate_users(200, 99);
