@@ -6,7 +6,7 @@
 
 using namespace bc;
 
-static int g_checks = 0, g_failures = 0;
+static int g_checks = 0, g_failures = 0; // nežinau kodėl taip veikia bet be \ jis kažkodėl atsisako veikt, turėjau bsk su DI pagalbos dėl šito
 #define CHECK(c)                                                                 \
     do {                                                                         \
         ++g_checks;                                                              \
@@ -25,11 +25,12 @@ static Config small_cfg(uint32_t diff = 2) {
 
 static void test_myhash() {
     std::cout << "[myhash etaloniniai vektoriai]\n";
-    // fill in after running: ./myhash -s "..."  for each string below
-    CHECK(myhash_hex("")     == "...............................................................");
-    CHECK(myhash_hex("abc")  == "...............................................................");
-    CHECK(myhash_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
-          == "...............................................................");
+    CHECK(myhash_hex("") ==
+      "78ebe000d4784925850fa5e45e536863ea7d7aa424d13a81d656b54d43583a90");
+    CHECK(myhash_hex("abc") ==
+      "746edecc82d44fffcc9e612ed45c1fd36177288a824654959979c36f9c7f2501");
+    CHECK(myhash_hex("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq") ==
+      "c4bf5e3b1960a75ac4c9b859181e0d8c812aa051f53870a9cb3a5e3e2013f788");
     CHECK(myhash_hex("abc").size() == 64);
     CHECK(myhash_hex("abc") != myhash_hex("abd"));
     CHECK(myhash_hex(std::string("abc")) != myhash_hex(std::string("abc") + '\0'));
