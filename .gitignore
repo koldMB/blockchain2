@@ -1,0 +1,6 @@
+*.o
+blockchain
+tests
+myhash
+initial_state.csv
+rejected.csv
