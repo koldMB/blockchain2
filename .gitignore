@@ -6,3 +6,4 @@ initial_state.csv
 rejected.csv
 *.exe
 /.idea
+*.csv
