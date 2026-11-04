@@ -11,6 +11,7 @@
 #include <sstream>
 #include <stdexcept>
 
+#include "merkle.h"
 #include "myhash.h"
 
 namespace bc {
@@ -35,7 +36,25 @@ Transaction make_tx(const std::string& sender, const std::string& receiver, int6
     return tx;
 }
 
-std::string compute_tx_root(const std::vector<Transaction>& txs) {
+bool is_supported_version(uint32_t v) { return v == kVersionLegacy || v == kVersionMerkle; }
+
+bool is_lower_hex(const std::string& s) {
+    if (s.empty()) return false;
+    for (char ch : s)
+        if (!((ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f'))) return false;
+    return true;
+}
+bool is_valid_tx_id(const std::string& s) { return s.size() == 64 && is_lower_hex(s); }
+
+// v1: myhash(id_1 || ... || id_n) (id po 64 simbolius, todel nedviprasme).
+// v2: merkle saknis (merkle.cpp). tuscias sarasas -> myhash_hex("") abiem atvejais.
+std::string compute_tx_root(const std::vector<Transaction>& txs, uint32_t version) {
+    if (version == kVersionMerkle) {
+        std::vector<std::string> ids;
+        ids.reserve(txs.size());
+        for (const auto& tx : txs) ids.push_back(tx.id);
+        return merkle_root(ids);
+    }
     std::string cat;
     cat.reserve(txs.size() * 64);
     for (const auto& tx : txs) cat += tx.id;
@@ -56,12 +75,12 @@ bool meets_difficulty(const std::string& hash, uint32_t difficulty) {
     return true;
 }
 
-Block make_genesis() {
+Block make_genesis(uint32_t version) {
     Block g;
     g.height = 0;
     g.header.prev_hash = std::string(64, '0');
     g.header.timestamp = kGenesisTimestamp;
-    g.header.version = kVersion;
+    g.header.version = version;
     g.header.tx_root = myhash_hex("");
     g.header.nonce = 0;
     g.header.difficulty = 0;
@@ -98,24 +117,38 @@ int64_t total_supply(const Balances& state) {
 
 bool verify_block(const Block& b, const Block& prev, const Balances& state,
                   const std::unordered_set<std::string>& seen_ids, uint32_t expected_difficulty,
-                  std::string& err) {
+                  std::string& err, size_t max_txs) {
     if (b.height != prev.height + 1) { err = "neteisingas aukstis"; return false; }
-    if (b.header.version != kVersion) { err = "nepalaikoma versija"; return false; }
+    if (!is_supported_version(b.header.version) || b.header.version != prev.header.version) {
+        err = "nepalaikoma arba nesutampanti formato versija";
+        return false;
+    }
     if (compute_header_hash(prev.header) != prev.hash) {
-        err = "ankstesnio bloko hash neatitinka jo antraštes";
+        err = "ankstesnio bloko hash neatitinka jo antrastes";
         return false;
     }
     if (b.header.prev_hash != prev.hash) { err = "prev_hash nesutampa su ankstesnio bloko hash"; return false; }
     if (b.header.timestamp < prev.header.timestamp) { err = "laiko zyma mazesne nei ankstesnio bloko"; return false; }
     if (b.txs.empty()) { err = "tuscias blokas"; return false; }
-    if (b.header.difficulty != expected_difficulty) { err = "netinkamas difficulty"; return false; }
-    if (compute_tx_root(b.txs) != b.header.tx_root) { err = "tx_root neatitinka transakciju"; return false; }
+    if (b.txs.size() > max_txs) { err = "per daug transakciju bloke"; return false; }
+    // sudetinguma nustato grandine; kandidatas jo sumazinti negali
+    if (b.header.difficulty != expected_difficulty) { err = "netinkamas difficulty (nesutampa su grandines nustatytu)"; return false; }
+    for (const auto& tx : b.txs)
+        if (!is_valid_tx_id(tx.id)) { err = "neteisingas transakcijos id formatas"; return false; }
+    std::string root;
+    try {
+        root = compute_tx_root(b.txs, b.header.version);
+    } catch (const std::exception&) {
+        err = "nepavyko apskaiciuoti tx_root";
+        return false;
+    }
+    if (root != b.header.tx_root) { err = "tx_root neatitinka transakciju"; return false; }
 
-    const std::string h = compute_header_hash(b.header);
-    if (h != b.hash) { err = "deklaruotas hash neatitinka antraštes"; return false; }
+    const std::string h = compute_header_hash(b.header);  // is naujo, nepasitikint b.hash
+    if (h != b.hash) { err = "deklaruotas hash neatitinka antrastes"; return false; }
     if (!meets_difficulty(h, b.header.difficulty)) { err = "hash netenkina pow salygos"; return false; }
 
-    Balances tmp = state;
+    Balances tmp = state;  // visas blokas tikrinamas vienoje laikinoje busenoje, tvarka
     std::unordered_set<std::string> local;
     for (size_t i = 0; i < b.txs.size(); ++i) {
         const Transaction& tx = b.txs[i];
@@ -125,18 +158,19 @@ bool verify_block(const Block& b, const Block& prev, const Balances& state,
             err = "tx " + std::to_string(i) + ": dubliuota transakcija";
             return false;
         }
-        if (apply_tx(tx, tmp) != ApplyStatus::Ok) {
-            err = "tx " + std::to_string(i) + ": nepakanka lesu arba netinkamas taikymas";
-            return false;
-        }
+        ApplyStatus st = apply_tx(tx, tmp);
+        if (st == ApplyStatus::InsufficientFunds) { err = "tx " + std::to_string(i) + ": nepakanka lesu (kartu su ankstesnemis bloke)"; return false; }
+        if (st == ApplyStatus::Overflow) { err = "tx " + std::to_string(i) + ": skaiciu perpildymas"; return false; }
+        if (st != ApplyStatus::Ok) { err = "tx " + std::to_string(i) + ": netaikoma busenai"; return false; }
     }
     return true;
 }
 
 bool validate_chain(const std::vector<Block>& chain, const Balances& initial,
-                    uint32_t expected_difficulty, std::string& err) {
+                    uint32_t expected_difficulty, std::string& err, size_t max_txs) {
     if (chain.empty()) { err = "tuscia grandine"; return false; }
-    const Block g = make_genesis();
+    if (!is_supported_version(chain[0].header.version)) { err = "genesis: nepalaikoma versija"; return false; }
+    const Block g = make_genesis(chain[0].header.version);
     if (chain[0].hash != g.hash || chain[0].header.prev_hash != g.header.prev_hash ||
         chain[0].header.tx_root != g.header.tx_root || !chain[0].txs.empty() || chain[0].height != 0) {
         err = "genesis blokas neatitinka apibrezimo";
@@ -147,7 +181,7 @@ bool validate_chain(const std::vector<Block>& chain, const Balances& initial,
     std::unordered_set<std::string> seen;
     for (size_t i = 1; i < chain.size(); ++i) {
         std::string e;
-        if (!verify_block(chain[i], chain[i - 1], state, seen, expected_difficulty, e)) {
+        if (!verify_block(chain[i], chain[i - 1], state, seen, expected_difficulty, e, max_txs)) {
             err = "blokas #" + std::to_string(i) + ": " + e;
             return false;
         }
@@ -250,7 +284,7 @@ SimResult run_simulation(const std::vector<User>& users, const std::vector<Trans
     Balances state = res.initial;
     res.supply_before = total_supply(state);
     res.total_input = input.size();
-    res.chain.push_back(make_genesis());
+    res.chain.push_back(make_genesis(cfg.version));
 
     std::vector<Pending> pool;
     std::unordered_set<std::string> pool_ids;
@@ -303,9 +337,9 @@ SimResult run_simulation(const std::vector<User>& users, const std::vector<Trans
         b.height = res.chain.size();
         b.txs = included;
         b.header.prev_hash = res.chain.back().hash;
-        b.header.version = kVersion;
+        b.header.version = cfg.version;
         b.header.difficulty = cfg.difficulty;
-        b.header.tx_root = compute_tx_root(b.txs);
+        b.header.tx_root = compute_tx_root(b.txs, cfg.version);
         int64_t ts = cfg.real_time ? static_cast<int64_t>(std::time(nullptr))
                                    : kGenesisTimestamp + static_cast<int64_t>(b.height) * kBlockInterval;
         b.header.timestamp = std::max(ts, res.chain.back().header.timestamp);
@@ -345,4 +379,4 @@ SimResult run_simulation(const std::vector<User>& users, const std::vector<Trans
     return res;
 }
 
-}  // namespace bc
+}
