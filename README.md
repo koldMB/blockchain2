@@ -90,7 +90,7 @@ make test        # arba:
 ./tests
 ```
 
-Tikimasi: `patikrinimu: N, nepavyko: 0`.
+Tikimasi: `patikrinimu: 1046, nepavyko: 0`.
 
 ### Sparčio patikra (v0.3)
 
@@ -264,19 +264,36 @@ Cikle tik `nonce` rašomas į `buf`, be `std::to_string` (naudojama `append_u64`
 
 ### Kasimo ciklo sparta
 
-| Kelias | Laikas 200k bandymų | Vidurkis | Sklaida |
-|--------|---------------------|----------|---------|
-| v0.2 (`serialize_header` per bandymą) | *išmatuoti* | *±* | *±* |
-| v0.3 (`HeaderSplit`) | *išmatuoti* | *±* | *±* |
-| **Pagreitis** | | **≈ 1.2–1.5×** | |
+Matuota Windows 11 (PowerShell), tas pats `g++ -std=c++17 -O2`, ta pati maiša
+(`myhash256 v2.0`), fiksuota antraštė (`prev_hash = "a"*64`, `tx_root = "b"*64`,
+`timestamp = kGenesisTimestamp`, `version = 2`, `difficulty = 8`, kad joks
+bandymas nepraeitų PoW). Kiekvienas paleidimas – 200 000 nonce.
 
-Kaip išmatuoti savo mašinoje:
+Pirmas paleidimas buvo atmestas kaip „warming-up“ (Windows DLL load,
+pirmas `myHash` iškvietimas, CPU power-state rampa). Vertinami paleidimai 2–5.
+
+| Kelias | Laikas 200k bandymų (4 paleidimai), ms | Vidurkis | Sklaida |
+|--------|----------------------------------------|----------|---------|
+| v0.2 (`serialize_header` per bandymą) | 662.97 / 632.20 / 637.94 / 643.15 | **644.07 ms** | ± 13.2 ms |
+| v0.3 (`HeaderSplit`) | 562.14 / 550.98 / 553.34 / 562.97 | **557.36 ms** | ± 5.7 ms |
+| **Pagreitis** | 644.07 / 557.36 | **≈ 1.16× (≈ 15.5 %)** | |
+
+Warm-up paleidimas (atmestas): v0.2 = 654.52 ms, v0.3 = 638.44 ms.
+
+**Ką tai reiškia.** `myHash` dominuoja (16 maišymo raundų po 8 žodžius), o
+antraštės serializacija teturi ~6 laukus, todėl didžiausias įmanomas
+pagreitis čia nedidelis. Išmatuotas ≈ 15 % atitinka lūkestį: pašalintos
+`std::to_string` alokacijos ir 5 `operator+` kopijavimai karštame cikle.
+Didesnio pagreičio tikėtis nereikėtų – tai būtų ženklas, kad kažkas ne taip
+su matavimu.
+
+**Reprodukcija:**
 
 ```bash
+g++ -std=c++17 -O2 -Wall -Wextra main.cpp blockchain.cpp competition.cpp merkle.cpp myhash.cpp -o blockchain
+./blockchain --bench-mine 200000   # warm-up, discard
 for i in 1 2 3 4 5; do ./blockchain --bench-mine 200000; done
 ```
-
-> **Ką tikėtis.** Kadangi `myHash` dominuoja (16 maišymo raundų), o serializacija teturi ~6 laukus, pagreitis realiai bus **10–30 %**. Nedidinkite `-O2` iki `-Ofast` — palyginimas turi būti sąžiningas.
 
 ### Validacijos korektiškumas
 
@@ -288,20 +305,13 @@ for i in 1 2 3 4 5; do ./blockchain --bench-mine 200000; done
 | Netinkamas PoW / `prev_hash` / `tx_root` | Atmetamas | Atmetamas |
 | Per didelis balansas / perpildymas | Atmetamas | Atmetamas |
 
-### Bendras paleidimo laikas
-
-| Versija | Bendras laikas | Pastaba |
-|---------|----------------|---------|
-| v0.2 | *iš `run_v02.log`* | |
-| v0.3 | *iš `run_v03.log`* | |
 
 ### Kas nepakito / liko apribojimai
 
 - **Nepakito:** maišos versija, Merkle medis, kandidatų skaičius (5), PoW sudėtingumas (3), kandidatų biudžeto augimo taisyklė (×2).
 - **Nepakito:** penkių kandidatų simuliacija **vis dar nėra** P2P konsensusas (nėra tinklo, nėra šakų persitvarkymo, nėra realaus Bitcoin kasimo).
 - **Nepakito:** `public_key` vis dar imituojamas — nėra tikrų skaitmeninių parašų. `tx.id` sutapimas tikrina vientisumą, bet ne siuntėjo tapatybę.
-- **Liko:** UTXO modelis ir lygiagretus kasimas — neprivalomi priedai, neįgyvendinti.
-- **Nepakito:** `myhash` kolizijų paieška — 60 000 įvesčių be kolizijų, bet tai tik sveikatos patikra, ne įrodymas.
+
 
 ---
 
@@ -309,7 +319,7 @@ for i in 1 2 3 4 5; do ./blockchain --bench-mine 200000; done
 
 1. **`HeaderSplit`:** `test_mining_equivalence()` įrodo tą patį `hash` ir `nonce`; `--bench-mine` matuoja spartą. Papildomai `test_competition()` (v0.2) vis dar praeina.
 2. **`seen_seqs` validacija:** `test_sequence_uniqueness()` 3 atvejai. Papildomai `validate_chain` naudoja tą patį `seen_seqs` rinkinį, tad ir pilnos grandinės patikra aptinka spragą.
-3. **Nauji testai:** kompiliuojasi ir praeina v0.3 (`patikrinimu: N, nepavyko: 0`).
+3. **Nauji testai:** kompiliuojasi ir praeina v0.3 (`patikrinimu: 1046, nepavyko: 0`).
 
 ---
 
@@ -319,6 +329,4 @@ for i in 1 2 3 4 5; do ./blockchain --bench-mine 200000; done
 - **Bitcoin Developer Reference: Block Chain** — realaus Bitcoin bloko struktūra palyginimui.
 - **C++ standardas (C++17)** — `std::unordered_map`, `std::mt19937_64` (bučiau naudojas 32 bitų versija bet tsg tai gal labiau atitinska standartus) std::to_string`.
 - **`tests.cpp` `#define CHECK`** — makro su `\` eilučių tęsiniu, sukurta pasitelkus DI. Makro semantika paprasta, studentas ją paaiškina.
----
 
-## Riba
