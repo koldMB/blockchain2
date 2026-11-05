@@ -537,6 +537,155 @@ static void test_competition_limits() {
     CHECK(r2.supply_after == 100);
 }
 
+// ===========================================================================
+// v0.3 additions
+// ===========================================================================
+
+// Sequence uniqueness must be enforced by verify_block itself.
+// v0.2 only checked this in Pool::admit -- a direct block injection bypassed
+// the pool and corrupted the chain. This test exercises the fixed behaviour.
+static void test_sequence_uniqueness() {
+    std::cout << "[v0.3: sequence unikalumas bloke ir grandineje]\n";
+
+    // (1) two different txs (different id) sharing one sequence in a block
+    {
+        Chain ch = test_chain(1000, 0);
+        Chain before = ch;
+        Block b;
+        b.height = 1;
+        b.header.prev_hash = ch.tip().hash;
+        b.header.version = ch.params.version;
+        b.header.difficulty = ch.params.difficulty;
+        b.header.timestamp = ch.tip().header.timestamp;
+        b.txs = {make_tx("aaaa", "bbbb", 1, 5), make_tx("aaaa", "cccc", 2, 5)};
+        b.header.tx_root = compute_tx_root(b.txs, b.header.version);
+        mine_block(b);
+        std::string err;
+        CHECK(!accept_block(ch, b, err));
+        CHECK(err.find("sequence") != std::string::npos);
+        CHECK(same_state(ch, before));
+    }
+
+    // (2) sequence already committed on the chain
+    {
+        Chain ch = test_chain(1000, 0);
+        std::string err;
+
+        Block b1;
+        b1.height = 1;
+        b1.header.prev_hash = ch.tip().hash;
+        b1.header.version = ch.params.version;
+        b1.header.difficulty = ch.params.difficulty;
+        b1.header.timestamp = ch.tip().header.timestamp;
+        b1.txs = {make_tx("aaaa", "bbbb", 1, 7)};
+        b1.header.tx_root = compute_tx_root(b1.txs, b1.header.version);
+        mine_block(b1);
+        CHECK(accept_block(ch, b1, err));
+
+        Chain after_b1 = ch;
+        Block b2;
+        b2.height = 2;
+        b2.header.prev_hash = ch.tip().hash;
+        b2.header.version = ch.params.version;
+        b2.header.difficulty = ch.params.difficulty;
+        b2.header.timestamp = ch.tip().header.timestamp;
+        b2.txs = {make_tx("aaaa", "cccc", 2, 7)};   // same sequence
+        b2.header.tx_root = compute_tx_root(b2.txs, b2.header.version);
+        mine_block(b2);
+        CHECK(!accept_block(ch, b2, err));
+        CHECK(err.find("sequence") != std::string::npos);
+        CHECK(same_state(ch, after_b1));
+    }
+
+    // (3) sanity: distinct sequences still work (regression guard)
+    {
+        Chain ch = test_chain(1000, 0);
+        Block b;
+        b.height = 1;
+        b.header.prev_hash = ch.tip().hash;
+        b.header.version = ch.params.version;
+        b.header.difficulty = ch.params.difficulty;
+        b.header.timestamp = ch.tip().header.timestamp;
+        b.txs = {make_tx("aaaa", "bbbb", 1, 100), make_tx("aaaa", "cccc", 2, 101)};
+        b.header.tx_root = compute_tx_root(b.txs, b.header.version);
+        mine_block(b);
+        std::string err;
+        CHECK(accept_block(ch, b, err));
+    }
+}
+
+// Optimised mining must produce bit-identical results to the legacy path
+// (compute_header_hash from scratch every attempt) for every nonce.
+static void test_mining_equivalence() {
+    std::cout << "[v0.3: optimizuotas kasimas duoda ta pati hash]\n";
+    BlockHeader h;
+    h.prev_hash = std::string(64, 'a');
+    h.timestamp = kGenesisTimestamp;
+    h.version = 2;
+    h.tx_root = std::string(64, 'b');
+    h.nonce = 0;
+    h.difficulty = 2;
+
+    // legacy: rebuild full serialize_header per attempt
+    BlockHeader h_old = h;
+    uint64_t nonce_old = 0;
+    for (;;) {
+        h_old.nonce = nonce_old;
+        if (meets_difficulty(compute_header_hash(h_old), h.difficulty)) break;
+        ++nonce_old;
+    }
+
+    // v0.3: full mine_block (uses HeaderSplit inside)
+    Block b;
+    b.header = h;
+    mine_block(b);
+    CHECK(b.header.nonce == nonce_old);
+    CHECK(b.hash == compute_header_hash(h_old));
+
+    // v0.3: mine_range must agree with mine_block for the same budget
+    Block b2;
+    b2.header = h;
+    uint64_t next_nonce = 0, used = 0;
+    bool ok = mine_range(b2, next_nonce, nonce_old + 1, used);
+    CHECK(ok);
+    CHECK(used == nonce_old + 1);
+    CHECK(b2.header.nonce == nonce_old);
+    CHECK(b2.hash == compute_header_hash(h_old));
+
+    // deterministic across calls
+    Block b3;
+    b3.header = h;
+    uint64_t n3 = 0, u3 = 0;
+    mine_range(b3, n3, 50, u3);
+    Block b4;
+    b4.header = h;
+    uint64_t n4 = 0, u4 = 0;
+    mine_range(b4, n4, 50, u4);
+    CHECK(u3 == u4);
+    CHECK(n3 == n4);
+    CHECK(b3.header.nonce == b4.header.nonce);
+    CHECK(b3.hash == b4.hash);
+}
+
+// Benchmark primitive must return positive timings for both paths.
+static void test_bench_mining() {
+    std::cout << "[v0.3: bench_mining]\n";
+    BlockHeader h;
+    h.prev_hash = std::string(64, 'a');
+    h.timestamp = kGenesisTimestamp;
+    h.version = 2;
+    h.tx_root = std::string(64, 'b');
+    h.nonce = 0;
+    h.difficulty = 8;                    // no attempt in [0, 2000) will succeed
+    BenchResult r = bench_mining(h, 2000);
+    CHECK(r.attempts == 2000);
+    CHECK(r.old_ms > 0.0);
+    CHECK(r.new_ms > 0.0);
+    // The optimisation is a pure memory/allocation win, so on any modern
+    // CPU new_ms should be <= old_ms * 1.5 (generous slack for noisy VMs).
+    // We do not assert a strict speedup here (machine-dependent); we only
+    // verify that both branches execute and produce positive timings.
+}
 
 int main() {
     test_myhash();
@@ -556,6 +705,10 @@ int main() {
     test_block_acceptance();
     test_competition();
     test_competition_limits();
+    // v0.3:
+    test_sequence_uniqueness();
+    test_mining_equivalence();
+    test_bench_mining();
     std::cout << "\npatikrinimu: " << g_checks << ", nepavyko: " << g_failures << "\n";
     return g_failures == 0 ? 0 : 1;
 }

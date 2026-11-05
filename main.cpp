@@ -14,8 +14,7 @@ static void usage() {
                  "   [--users N] [--txs N] [--seed S] [--difficulty D] [--block-size B]\n"
                  "   [--candidates N] [--budget N] [--growth N] [--max-attempts N] [--time-limit SEK]\n"
                  "   [--max-defers M] [--max-blocks N] [--no-invalid] [--real-time] [--full-hash] [--quiet]\n"
-                 "compete (numatyta) = v0.2: 5 kandidatu lenktynes, Merkle (version 2).\n"
-                 "legacy = v0.1 nuoseklus kasejas (su --version 1 - tikslus v0.1 formatas).\n";
+                 "   [--bench-mine N]  (v0.3: palygina sena ir optimizuota kasima, N bandymu)\n";
 }
 
 static void write_rejected(const std::vector<RejectedTx>& a, const std::vector<RejectedTx>& b) {
@@ -65,15 +64,38 @@ int main(int argc, char** argv) {
             else if (a == "--real-time") cfg.real_time = true;
             else if (a == "--full-hash") cfg.full_hash = true;
             else if (a == "--quiet") cfg.verbose = false;
+            else if (a == "--bench-mine") cfg.bench_mine = std::stoull(next());
             else if (a == "--help" || a == "-h") { usage(); return 0; }
             else throw std::runtime_error("nezinomas argumentas: " + a);
         }
+
+        // v0.3: benchmark mode — runs before the simulation, exits early.
+        if (cfg.bench_mine > 0) {
+            BlockHeader h;
+            h.prev_hash = std::string(64, 'a');
+            h.timestamp = kGenesisTimestamp;
+            h.version = 2;
+            h.tx_root = std::string(64, 'b');
+            h.nonce = 0;
+            h.difficulty = 8;  // so no nonce in [0, N) succeeds
+            BenchResult r = bench_mining(h, cfg.bench_mine);
+            std::cout << "=== Kasimo benchmark (v0.3) ===\n"
+                      << "N = " << r.attempts << " bandymu, fiksuota antrašte\n"
+                      << "v0.2 kelias:  " << std::fixed << std::setprecision(3) << r.old_ms << " ms ("
+                      << std::setprecision(0) << (r.old_ms > 0 ? r.attempts * 1000.0 / r.old_ms : 0) << " h/s)\n"
+                      << "v0.3 kelias:  " << std::fixed << std::setprecision(3) << r.new_ms << " ms ("
+                      << std::setprecision(0) << (r.new_ms > 0 ? r.attempts * 1000.0 / r.new_ms : 0) << " h/s)\n"
+                      << "pagreitis:    " << std::setprecision(2)
+                      << (r.new_ms > 0 ? r.old_ms / r.new_ms : 0) << "x\n";
+            return 0;
+        }
+
         if ((mode != "compete" && mode != "legacy") || !is_supported_version(cfg.version) || cfg.block_size == 0 ||
             cfg.num_users < 2 || cfg.max_defers < 1 || cfg.difficulty > 8 || cfg.num_candidates == 0 ||
             cfg.initial_budget == 0 || cfg.budget_growth < 1 || cfg.max_attempts == 0)
             throw std::runtime_error("netinkami parametrai");
 
-        std::cout << "=== Supaprastinta bloku grandine v0.2 (rezimas: " << mode << ") ===\n"
+        std::cout << "=== Supaprastinta bloku grandine v0.3 (rezimas: " << mode << ") ===\n"
                   << "seed=" << cfg.seed << " users=" << cfg.num_users << " txs=" << cfg.num_txs
                   << " block_size=" << cfg.block_size << " difficulty=" << cfg.difficulty
                   << " hash=myhash256 v2.0 formato versija=" << cfg.version
@@ -130,7 +152,6 @@ int main(int argc, char** argv) {
         std::string err;
         bool ok = validate_chain(r.chain.blocks, r.chain.initial, cfg.difficulty, err, cfg.block_size);
 
-        // Kandidatu statistika.
         std::vector<size_t> wins(cfg.num_candidates + 1, 0);
         std::vector<uint64_t> att(cfg.num_candidates + 1, 0);
         std::vector<double> ms(cfg.num_candidates + 1, 0);

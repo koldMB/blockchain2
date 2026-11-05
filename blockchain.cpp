@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <climits>
+#include <cstring>
 #include <ctime>
 #include <iomanip>
 #include <iostream>
@@ -16,28 +17,67 @@
 
 namespace bc {
 
+// ---------------------------------------------------------------------------
+// v0.3 (AI): decimal append without std::to_string allocation.
+// Same byte output as std::to_string(uint64_t).
+// ---------------------------------------------------------------------------
+namespace {
+
+void append_u64(std::string& out, uint64_t v) {
+    if (v == 0) { out += '0'; return; }
+    char tmp[21];
+    int i = 20;
+    while (v > 0) { tmp[--i] = static_cast<char>('0' + (v % 10)); v /= 10; }
+    out.append(tmp + i, static_cast<size_t>(20 - i));
+}
+
+// Splits a header into two halves around `nonce`.
+struct HeaderSplit {
+    std::string prefix;   // prev_hash|timestamp|version|tx_root|
+    std::string suffix;   // |difficulty
+    std::string buf;      // reusable, capacity pre-reserved
+
+    explicit HeaderSplit(const BlockHeader& h) {
+        prefix.reserve(64 + 12 + 12 + 64 + 4);
+        prefix += h.prev_hash; prefix += '|';
+        append_u64(prefix, static_cast<uint64_t>(h.timestamp)); prefix += '|';
+        append_u64(prefix, h.version); prefix += '|';
+        prefix += h.tx_root; prefix += '|';
+        suffix += '|';
+        append_u64(suffix, h.difficulty);
+        buf.reserve(prefix.size() + 21 + suffix.size());
+    }
+
+    // Rebuilds buf = prefix + nonce + suffix and returns myhash_hex(buf).
+    std::string hash_for(uint64_t nonce) {
+        buf.assign(prefix);
+        append_u64(buf, nonce);
+        buf += suffix;
+        return myhash_hex(buf);
+    }
+};
+
+}  // namespace
+
+// ---------------------------------------------------------------------------
+// Serialization / tx
+// ---------------------------------------------------------------------------
 std::string serialize_tx(const std::string& sender, const std::string& receiver, int64_t amount,
                          uint64_t sequence) {
     return sender + "|" + receiver + "|" + std::to_string(amount) + "|" + std::to_string(sequence);
 }
-
 std::string compute_tx_id(const Transaction& tx) {
     return myhash_hex(serialize_tx(tx.sender, tx.receiver, tx.amount, tx.sequence));
 }
-
 Transaction make_tx(const std::string& sender, const std::string& receiver, int64_t amount,
                     uint64_t sequence) {
     Transaction tx;
-    tx.sender = sender;
-    tx.receiver = receiver;
-    tx.amount = amount;
-    tx.sequence = sequence;
+    tx.sender = sender; tx.receiver = receiver;
+    tx.amount = amount; tx.sequence = sequence;
     tx.id = compute_tx_id(tx);
     return tx;
 }
-
 bool is_supported_version(uint32_t v) { return v == kVersionLegacy || v == kVersionMerkle; }
-
 bool is_lower_hex(const std::string& s) {
     if (s.empty()) return false;
     for (char ch : s)
@@ -46,8 +86,6 @@ bool is_lower_hex(const std::string& s) {
 }
 bool is_valid_tx_id(const std::string& s) { return s.size() == 64 && is_lower_hex(s); }
 
-// v1: myhash(id_1 || ... || id_n) (id po 64 simbolius, todel nedviprasme).
-// v2: merkle saknis (merkle.cpp). tuscias sarasas -> myhash_hex("") abiem atvejais.
 std::string compute_tx_root(const std::vector<Transaction>& txs, uint32_t version) {
     if (version == kVersionMerkle) {
         std::vector<std::string> ids;
@@ -65,7 +103,6 @@ std::string serialize_header(const BlockHeader& h) {
     return h.prev_hash + "|" + std::to_string(h.timestamp) + "|" + std::to_string(h.version) + "|" +
            h.tx_root + "|" + std::to_string(h.nonce) + "|" + std::to_string(h.difficulty);
 }
-
 std::string compute_header_hash(const BlockHeader& h) { return myhash_hex(serialize_header(h)); }
 
 bool meets_difficulty(const std::string& hash, uint32_t difficulty) {
@@ -108,55 +145,59 @@ ApplyStatus apply_tx(const Transaction& tx, Balances& state) {
     r->second += tx.amount;
     return ApplyStatus::Ok;
 }
-
 int64_t total_supply(const Balances& state) {
     int64_t sum = 0;
     for (const auto& kv : state) sum += kv.second;
     return sum;
 }
 
+// ---------------------------------------------------------------------------
+// verify_block — v0.3 adds in-block + chain-level sequence uniqueness
+// ---------------------------------------------------------------------------
 bool verify_block(const Block& b, const Block& prev, const Balances& state,
                   const std::unordered_set<std::string>& seen_ids, uint32_t expected_difficulty,
-                  std::string& err, size_t max_txs) {
+                  std::string& err, size_t max_txs,
+                  const std::unordered_set<uint64_t>& seen_seqs) {
     if (b.height != prev.height + 1) { err = "neteisingas aukstis"; return false; }
     if (!is_supported_version(b.header.version) || b.header.version != prev.header.version) {
-        err = "nepalaikoma arba nesutampanti formato versija";
-        return false;
+        err = "nepalaikoma arba nesutampanti formato versija"; return false;
     }
     if (compute_header_hash(prev.header) != prev.hash) {
-        err = "ankstesnio bloko hash neatitinka jo antrastes";
-        return false;
+        err = "ankstesnio bloko hash neatitinka jo antrastes"; return false;
     }
     if (b.header.prev_hash != prev.hash) { err = "prev_hash nesutampa su ankstesnio bloko hash"; return false; }
     if (b.header.timestamp < prev.header.timestamp) { err = "laiko zyma mazesne nei ankstesnio bloko"; return false; }
     if (b.txs.empty()) { err = "tuscias blokas"; return false; }
     if (b.txs.size() > max_txs) { err = "per daug transakciju bloke"; return false; }
-    // sudetinguma nustato grandine; kandidatas jo sumazinti negali
     if (b.header.difficulty != expected_difficulty) { err = "netinkamas difficulty (nesutampa su grandines nustatytu)"; return false; }
     for (const auto& tx : b.txs)
         if (!is_valid_tx_id(tx.id)) { err = "neteisingas transakcijos id formatas"; return false; }
+
     std::string root;
-    try {
-        root = compute_tx_root(b.txs, b.header.version);
-    } catch (const std::exception&) {
-        err = "nepavyko apskaiciuoti tx_root";
-        return false;
-    }
+    try { root = compute_tx_root(b.txs, b.header.version); }
+    catch (const std::exception&) { err = "nepavyko apskaiciuoti tx_root"; return false; }
     if (root != b.header.tx_root) { err = "tx_root neatitinka transakciju"; return false; }
 
-    const std::string h = compute_header_hash(b.header);  // is naujo, nepasitikint b.hash
+    const std::string h = compute_header_hash(b.header);
     if (h != b.hash) { err = "deklaruotas hash neatitinka antrastes"; return false; }
     if (!meets_difficulty(h, b.header.difficulty)) { err = "hash netenkina pow salygos"; return false; }
 
-    Balances tmp = state;  // visas blokas tikrinamas vienoje laikinoje busenoje, tvarka
-    std::unordered_set<std::string> local;
+    Balances tmp = state;
+    std::unordered_set<std::string> local_ids;
+    std::unordered_set<uint64_t> local_seqs;          // v0.3
     for (size_t i = 0; i < b.txs.size(); ++i) {
         const Transaction& tx = b.txs[i];
         std::string why = check_tx_structure(tx, tmp);
         if (!why.empty()) { err = "tx " + std::to_string(i) + ": " + why; return false; }
-        if (seen_ids.count(tx.id) || !local.insert(tx.id).second) {
-            err = "tx " + std::to_string(i) + ": dubliuota transakcija";
-            return false;
+        if (seen_ids.count(tx.id) || !local_ids.insert(tx.id).second) {
+            err = "tx " + std::to_string(i) + ": dubliuota transakcija"; return false;
+        }
+        // v0.3 (AI): sequence uniqueness — within block and against chain
+        if (!local_seqs.insert(tx.sequence).second) {
+            err = "tx " + std::to_string(i) + ": pasikartojantis sequence bloke"; return false;
+        }
+        if (seen_seqs.count(tx.sequence)) {
+            err = "tx " + std::to_string(i) + ": sequence jau panaudotas grandineje"; return false;
         }
         ApplyStatus st = apply_tx(tx, tmp);
         if (st == ApplyStatus::InsufficientFunds) { err = "tx " + std::to_string(i) + ": nepakanka lesu (kartu su ankstesnemis bloke)"; return false; }
@@ -173,43 +214,89 @@ bool validate_chain(const std::vector<Block>& chain, const Balances& initial,
     const Block g = make_genesis(chain[0].header.version);
     if (chain[0].hash != g.hash || chain[0].header.prev_hash != g.header.prev_hash ||
         chain[0].header.tx_root != g.header.tx_root || !chain[0].txs.empty() || chain[0].height != 0) {
-        err = "genesis blokas neatitinka apibrezimo";
-        return false;
+        err = "genesis blokas neatitinka apibrezimo"; return false;
     }
     Balances state = initial;
     const int64_t supply = total_supply(initial);
-    std::unordered_set<std::string> seen;
+    std::unordered_set<std::string> seen_ids;
+    std::unordered_set<uint64_t> seen_seqs;
     for (size_t i = 1; i < chain.size(); ++i) {
         std::string e;
-        if (!verify_block(chain[i], chain[i - 1], state, seen, expected_difficulty, e, max_txs)) {
-            err = "blokas #" + std::to_string(i) + ": " + e;
-            return false;
+        if (!verify_block(chain[i], chain[i - 1], state, seen_ids, expected_difficulty, e, max_txs, seen_seqs)) {
+            err = "blokas #" + std::to_string(i) + ": " + e; return false;
         }
         for (const auto& tx : chain[i].txs) {
             apply_tx(tx, state);
-            seen.insert(tx.id);
+            seen_ids.insert(tx.id);
+            seen_seqs.insert(tx.sequence);
         }
     }
-    for (const auto& kv : state)
-        if (kv.second < 0) { err = "neigiamas balansas"; return false; }
+    for (const auto& kv : state) if (kv.second < 0) { err = "neigiamas balansas"; return false; }
     if (total_supply(state) != supply) { err = "bendra lesu suma pasikeite"; return false; }
     return true;
 }
 
+// ---------------------------------------------------------------------------
+// Mining (v0.3 — optimised)
+// ---------------------------------------------------------------------------
 uint64_t mine_block(Block& b) {
+    HeaderSplit hs(b.header);
     uint64_t attempts = 0;
     b.header.nonce = 0;
     for (;;) {
         ++attempts;
-        std::string h = compute_header_hash(b.header);
-        if (meets_difficulty(h, b.header.difficulty)) {
-            b.hash = h;
-            return attempts;
-        }
+        std::string h = hs.hash_for(b.header.nonce);
+        if (meets_difficulty(h, b.header.difficulty)) { b.hash = h; return attempts; }
         ++b.header.nonce;
     }
 }
 
+bool mine_range(Block& b, uint64_t& next_nonce, uint64_t budget, uint64_t& used) {
+    used = 0;
+    HeaderSplit hs(b.header);
+    for (uint64_t i = 0; i < budget; ++i) {
+        b.header.nonce = next_nonce++;
+        ++used;
+        std::string h = hs.hash_for(b.header.nonce);
+        if (meets_difficulty(h, b.header.difficulty)) { b.hash = h; return true; }
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// bench_mining — old (compose whole header each attempt) vs new
+// ---------------------------------------------------------------------------
+BenchResult bench_mining(const BlockHeader& header, uint64_t budget) {
+    using clock = std::chrono::steady_clock;
+    BenchResult r;
+    Block b;
+    b.header = header;
+    b.header.nonce = 0;
+
+    // old path: full serialize_header + myhash_hex each attempt
+    auto t0 = clock::now();
+    for (uint64_t i = 0; i < budget; ++i) {
+        b.header.nonce = i;
+        std::string h = compute_header_hash(b.header);
+        (void)h;
+        ++r.attempts;
+    }
+    r.old_ms = std::chrono::duration<double, std::milli>(clock::now() - t0).count();
+
+    // new path: HeaderSplit (fixed prefix/suffix, only nonce rebuilt)
+    HeaderSplit hs(b.header);
+    auto t1 = clock::now();
+    for (uint64_t i = 0; i < budget; ++i) {
+        std::string h = hs.hash_for(i);
+        (void)h;
+    }
+    r.new_ms = std::chrono::duration<double, std::milli>(clock::now() - t1).count();
+    return r;
+}
+
+// ---------------------------------------------------------------------------
+// Generation
+// ---------------------------------------------------------------------------
 std::vector<User> generate_users(size_t n, uint64_t seed) {
     std::mt19937_64 rng(seed);
     std::unordered_set<std::string> keys;
@@ -241,10 +328,8 @@ std::vector<Transaction> generate_transactions(const std::vector<User>& users, s
         if (ri >= si) ++ri;
         const int64_t bal = users[si].balance;
         int64_t amount;
-        if (rng() % 50 == 0)
-            amount = 1 + static_cast<int64_t>(rng() % static_cast<uint64_t>(2 * bal));
-        else
-            amount = 1 + static_cast<int64_t>(rng() % static_cast<uint64_t>(std::max<int64_t>(1, bal / 10)));
+        if (rng() % 50 == 0) amount = 1 + static_cast<int64_t>(rng() % static_cast<uint64_t>(2 * bal));
+        else amount = 1 + static_cast<int64_t>(rng() % static_cast<uint64_t>(std::max<int64_t>(1, bal / 10)));
         txs.push_back(make_tx(users[si].public_key, users[ri].public_key, amount, i));
     }
     if (inject_invalid) {
@@ -265,14 +350,13 @@ std::vector<Transaction> generate_transactions(const std::vector<User>& users, s
     return txs;
 }
 
+// ---------------------------------------------------------------------------
+// v0.1 legacy simulator (with v0.3 sequence tracking added)
+// ---------------------------------------------------------------------------
 namespace {
 std::string shorten(const std::string& h, bool full) { return full ? h : h.substr(0, 16) + ".."; }
-
-struct Pending {
-    Transaction tx;
-    int defers = 0;
-};
-}
+struct Pending { Transaction tx; int defers = 0; };
+}  // namespace
 
 SimResult run_simulation(const std::vector<User>& users, const std::vector<Transaction>& input,
                          const Config& cfg, std::ostream* out) {
@@ -293,10 +377,7 @@ SimResult run_simulation(const std::vector<User>& users, const std::vector<Trans
         std::string why = check_tx_structure(tx, state);
         if (why.empty() && pool_ids.count(tx.id)) why = "dubliuota transakcija (toks pat id)";
         if (why.empty() && pool_seq.count(tx.sequence)) why = "pasikartojantis sequence";
-        if (!why.empty()) {
-            res.rejected.push_back({tx, why});
-            continue;
-        }
+        if (!why.empty()) { res.rejected.push_back({tx, why}); continue; }
         pool_ids.insert(tx.id);
         pool_seq.insert(tx.sequence);
         pool.push_back({tx, 0});
@@ -304,6 +385,7 @@ SimResult run_simulation(const std::vector<User>& users, const std::vector<Trans
 
     std::mt19937_64 rng(cfg.seed ^ 0xB10C0001ULL);
     std::unordered_set<std::string> chain_ids;
+    std::unordered_set<uint64_t> chain_seqs;   // v0.3
 
     while (!pool.empty() && (cfg.max_blocks == 0 || res.chain.size() - 1 < cfg.max_blocks)) {
         const size_t k = std::min(cfg.block_size, pool.size());
@@ -319,17 +401,12 @@ SimResult run_simulation(const std::vector<User>& users, const std::vector<Trans
         std::vector<Transaction> included;
         for (auto& p : cand) {
             ApplyStatus st = apply_tx(p.tx, temp);
-            if (st == ApplyStatus::Ok) {
-                included.push_back(p.tx);
-            } else if (st == ApplyStatus::InsufficientFunds) {
+            if (st == ApplyStatus::Ok) { included.push_back(p.tx); }
+            else if (st == ApplyStatus::InsufficientFunds) {
                 if (++p.defers >= cfg.max_defers)
-                    res.rejected.push_back(
-                        {p.tx, "nepakanka lesu (atmesta po " + std::to_string(p.defers) + " bandymu)"});
-                else
-                    pool.push_back(std::move(p));
-            } else {
-                res.rejected.push_back({p.tx, "netaikoma busenai (perpildymas arba netinkama saskaita)"});
-            }
+                    res.rejected.push_back({p.tx, "nepakanka lesu (atmesta po " + std::to_string(p.defers) + " bandymu)"});
+                else pool.push_back(std::move(p));
+            } else res.rejected.push_back({p.tx, "netaikoma busenai (perpildymas arba netinkama saskaita)"});
         }
         if (included.empty()) continue;
 
@@ -349,12 +426,9 @@ SimResult run_simulation(const std::vector<User>& users, const std::vector<Trans
         const double ms = std::chrono::duration<double, std::milli>(clock::now() - m0).count();
 
         std::string err;
-        if (!verify_block(b, res.chain.back(), state, chain_ids, cfg.difficulty, err))
+        if (!verify_block(b, res.chain.back(), state, chain_ids, cfg.difficulty, err, SIZE_MAX, chain_seqs))
             throw std::runtime_error("iskastas blokas nepraėjo patikros: " + err);
-        for (const auto& tx : b.txs) {
-            apply_tx(tx, state);
-            chain_ids.insert(tx.id);
-        }
+        for (const auto& tx : b.txs) { apply_tx(tx, state); chain_ids.insert(tx.id); chain_seqs.insert(tx.sequence); }
         res.included += b.txs.size();
         res.total_attempts += attempts;
         res.stats.push_back({attempts, ms});

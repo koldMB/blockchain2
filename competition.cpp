@@ -1,4 +1,5 @@
-// v0.2: transakciju fondas, kandidatu atranka, 5 kandidatu lenktynes, galutinis bloko priemimas.
+// v0.3: kandidatu lenktynes. Kasimo ciklas naudoja optimizuota mine_range
+// (perkelta i blockchain.cpp); kitu pakeitimu nera — semantika tokia pati kaip v0.2.
 #include <algorithm>
 #include <chrono>
 #include <ctime>
@@ -13,18 +14,16 @@ namespace bc {
 
 namespace {
 std::string shorten(const std::string& h, bool full) { return full ? h : h.substr(0, 16) + ".."; }
-
 struct Cand {
     int index = 0;
     Block block;
-    uint64_t next_nonce = 0;  // kitas dar netikrintas nonce
+    uint64_t next_nonce = 0;
     uint64_t attempts = 0;
     double ms = 0;
     bool solved = false;
 };
 }  // namespace
 
-//  grandine
 Chain make_chain(const std::vector<User>& users, const ChainParams& params) {
     Chain c;
     c.params = params;
@@ -34,12 +33,11 @@ Chain make_chain(const std::vector<User>& users, const ChainParams& params) {
     return c;
 }
 
-//  pool
 std::string Pool::admit(const Transaction& tx, const Chain& chain) {
     if (!is_lower_hex(tx.sender) || !is_lower_hex(tx.receiver))
         return "neteisingas dalyvio identifikatoriaus formatas";
     if (!is_valid_tx_id(tx.id)) return "neteisingas transakcijos ID formatas";
-    std::string why = check_tx_structure(tx, chain.balances);  // dalyviai, suma > 0, ID perskaiciavimas
+    std::string why = check_tx_structure(tx, chain.balances);
     if (!why.empty()) return why;
     if (chain.ids.count(tx.id)) return "ID jau itrauktas i grandine";
     if (ids_.count(tx.id)) return "ID jau yra fonde";
@@ -57,29 +55,21 @@ void Pool::remove_included(const std::vector<Transaction>& included) {
     std::vector<Transaction> keep;
     keep.reserve(txs_.size());
     for (auto& t : txs_) {
-        if (rm.count(t.id)) {
-            ids_.erase(t.id);
-            seqs_.erase(t.sequence);
-        } else {
-            keep.push_back(std::move(t));
-        }
+        if (rm.count(t.id)) { ids_.erase(t.id); seqs_.erase(t.sequence); }
+        else keep.push_back(std::move(t));
     }
     txs_ = std::move(keep);
 }
 
-//  kandidatas
 std::vector<Transaction> filter_executable(const Balances& committed,
                                            const std::vector<Transaction>& ordered, size_t max_txs) {
-    Balances tmp = committed;  // tikrieji balansai nekeiciami
+    Balances tmp = committed;
     std::vector<Transaction> out;
     std::unordered_set<std::string> local;
     for (const auto& tx : ordered) {
         if (out.size() >= max_txs) break;
-        if (local.count(tx.id)) continue;  // viename kandidate nesikartoja
-        if (apply_tx(tx, tmp) == ApplyStatus::Ok) {
-            out.push_back(tx);
-            local.insert(tx.id);
-        }
+        if (local.count(tx.id)) continue;
+        if (apply_tx(tx, tmp) == ApplyStatus::Ok) { out.push_back(tx); local.insert(tx.id); }
     }
     return out;
 }
@@ -89,8 +79,7 @@ std::vector<Transaction> select_candidate(const Balances& committed, const Pool&
     const auto& all = pool.txs();
     std::vector<size_t> idx(all.size());
     for (size_t i = 0; i < idx.size(); ++i) idx[i] = i;
-    for (size_t i = idx.size(); i > 1; --i) std::swap(idx[i - 1], idx[rng() % i]);  // Fisher-Yates
-
+    for (size_t i = idx.size(); i > 1; --i) std::swap(idx[i - 1], idx[rng() % i]);
     Balances tmp = committed;
     std::vector<Transaction> out;
     for (size_t i : idx) {
@@ -106,7 +95,7 @@ Block make_candidate_block(const Chain& chain, std::vector<Transaction> txs, boo
     b.txs = std::move(txs);
     b.header.prev_hash = chain.tip().hash;
     b.header.version = chain.params.version;
-    b.header.difficulty = chain.params.difficulty;  // paimta is grandines, ne is kandidato
+    b.header.difficulty = chain.params.difficulty;
     b.header.tx_root = compute_tx_root(b.txs, b.header.version);
     int64_t ts = real_time ? static_cast<int64_t>(std::time(nullptr))
                            : kGenesisTimestamp + static_cast<int64_t>(b.height) * kBlockInterval;
@@ -114,47 +103,20 @@ Block make_candidate_block(const Chain& chain, std::vector<Transaction> txs, boo
     return b;
 }
 
-bool mine_range(Block& b, uint64_t& next_nonce, uint64_t budget, uint64_t& used) {
-    used = 0;
-    for (uint64_t i = 0; i < budget; ++i) {
-        b.header.nonce = next_nonce++;
-        ++used;
-        std::string h = compute_header_hash(b.header);
-        if (meets_difficulty(h, b.header.difficulty)) {
-            b.hash = h;
-            return true;
-        }
-    }
-    return false;
-}
-
-// galutinis priemimas
 bool accept_block(Chain& chain, const Block& b, std::string& err) {
     if (b.header.version != chain.params.version) { err = "versija nesutampa su grandines"; return false; }
     if (!verify_block(b, chain.tip(), chain.balances, chain.ids, chain.params.difficulty, err,
-                      chain.params.max_txs))
+                      chain.params.max_txs, chain.seqs))
         return false;
-    // Visi pakeitimai paruosiami kopijose; grandine keiciama tik po sekmingos patikros.
     Balances nb = chain.balances;
     for (const auto& tx : b.txs)
         if (apply_tx(tx, nb) != ApplyStatus::Ok) { err = "netaikoma busenai"; return false; }
     chain.balances = std::move(nb);
-    for (const auto& tx : b.txs) {
-        chain.ids.insert(tx.id);
-        chain.seqs.insert(tx.sequence);
-    }
+    for (const auto& tx : b.txs) { chain.ids.insert(tx.id); chain.seqs.insert(tx.sequence); }
     chain.blocks.push_back(b);
     return true;
 }
 
-// lenktynes
-// Taisykles (dokumentuota README):
-//  * kandidatai K1..KN kuriami is to paties tip ir tos pacios patvirtintos busenos;
-//  * kiekviename raunde kandidatai tikrinami nuosekliai K1, K2, ... ir gauna ta pati bandymu biudzeta;
-//    kitame raunde biudzetas padidinamas (x budget_growth) ir kasama nuo dar netikrintu nonce;
-//  * pirmame raunde, kuriame yra sprendimu, laimi kandidatas su MAZIAUSIU bandymu skaiciumi
-//    (lygiavertes kasimo galios modelis); lygiuju atveju - mazesnis indeksas;
-//  * sudetingumas niekada nemazinamas; ribos: max_attempts ir time_limit_s kiekvienam kandidatui.
 CompResult run_competition(const std::vector<User>& users, const std::vector<Transaction>& input,
                            const Config& cfg, std::ostream* out) {
     using clock = std::chrono::steady_clock;
@@ -179,7 +141,6 @@ CompResult run_competition(const std::vector<User>& users, const std::vector<Tra
     std::mt19937_64 rng(cfg.seed ^ 0xC0FFEEULL);
 
     while (!pool.empty() && (cfg.max_blocks == 0 || res.chain.blocks.size() - 1 < cfg.max_blocks)) {
-        // --- kandidatu sudarymas (kiekvienas is savo laikinos kopijos, ta pati patvirtinta busena)
         std::vector<Cand> cands;
         for (size_t k = 0; k < cfg.num_candidates; ++k) {
             auto txs = select_candidate(res.chain.balances, pool, rng, cfg.block_size);
@@ -198,12 +159,10 @@ CompResult run_competition(const std::vector<User>& users, const std::vector<Tra
         race.height = res.chain.blocks.size();
         {
             std::unordered_set<std::string> d;
-            for (const auto& c : cands)
-                for (const auto& tx : c.block.txs) d.insert(tx.id);
+            for (const auto& c : cands) for (const auto& tx : c.block.txs) d.insert(tx.id);
             race.distinct_txs = d.size();
         }
 
-        // --- kasimas raundais
         uint64_t budget = cfg.initial_budget;
         int winner = -1, round = 0;
         auto exhausted = [&](const Cand& c) {
@@ -212,13 +171,13 @@ CompResult run_competition(const std::vector<User>& users, const std::vector<Tra
         for (;;) {
             ++round;
             bool any_active = false;
-            for (auto& c : cands) {  // tikrinimo tvarka: K1, K2, ...
+            for (auto& c : cands) {
                 if (c.solved || exhausted(c)) continue;
                 any_active = true;
                 const uint64_t allowed = std::min<uint64_t>(budget, cfg.max_attempts - c.attempts);
                 uint64_t used = 0;
                 const auto m0 = clock::now();
-                bool ok = mine_range(c.block, c.next_nonce, allowed, used);
+                bool ok = mine_range(c.block, c.next_nonce, allowed, used);   // v0.3 optimised
                 c.ms += std::chrono::duration<double, std::milli>(clock::now() - m0).count();
                 c.attempts += used;
                 if (ok) c.solved = true;
@@ -252,7 +211,6 @@ CompResult run_competition(const std::vector<User>& users, const std::vector<Tra
             break;
         }
 
-        // --- laimetojo pakartotine patikra ir priemimas; nelaimejusiu kandidatu poveikio nera
         const Block& w = cands[static_cast<size_t>(winner)].block;
         std::string err;
         if (!accept_block(res.chain, w, err))
@@ -277,7 +235,6 @@ CompResult run_competition(const std::vector<User>& users, const std::vector<Tra
         res.races.push_back(std::move(race));
     }
 
-    // --- likusiu transakciju suvestine su priezastimi
     for (const auto& tx : pool.txs()) {
         std::string reason;
         auto it = res.chain.balances.find(tx.sender);
